@@ -1,0 +1,1112 @@
+<!doctype html>
+<!--
+  herdr-web — browser frontend for herdr, tuned for iPad Safari.
+
+  This is a TEMPLATE, not a servable file. scripts/install.sh
+  substitutes the @@XTERM_*@@ markers below with vendored xterm.js sources and
+  writes the result to ~/.local/share/herdr-web/index.html, which is what ttyd
+  actually serves. Editing this file alone changes nothing on the box — re-run
+  the install script.
+
+  Why everything is inlined: ttyd's -I/--index takes a single file and
+  explicitly rejects a directory (src/server.c, case 'I'), and sibling assets
+  next to it are not served. So the page has to be self-contained. It loads
+  nothing from the network at runtime — same posture as bridge/watchtower.html.
+
+  The wire protocol below is ttyd 1.7.7's, read off
+  html/src/components/terminal/xterm/index.ts:
+    GET token              -> {"token": "..."}
+    WebSocket ws, subprotocol "tty"
+    first client message   -> {"AuthToken": t, "columns": c, "rows": r}
+    client -> server       '0'+input  '1'+{columns,rows}  '2' pause  '3' resume
+    server -> client       '0'+output '1'+title           '2'+preferences JSON
+  All payloads are UTF-8.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- user-scalable=no: pinch-zoom on a terminal just fights the fit addon, and
+     iOS otherwise auto-zooms on focus, which shifts the whole layout. -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>herdr — terminal</title>
+<style>
+@@XTERM_CSS@@
+</style>
+<style>
+  :root {
+    /* Dracula, to match the desktop herdr theme (config.toml: name = "dracula"). */
+    --bg: #282a36;
+    --fg: #f8f8f2;
+    --bar-bg: #21222c;
+    --key-bg: #343746;
+    --key-fg: #f8f8f2;
+    --key-active: #bd93f9;
+    --key-armed: #50fa7b;
+    --edge: #44475a;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    overflow: hidden;
+    font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    /* Stop iOS rubber-banding the whole page while scrolling the terminal. */
+    overscroll-behavior: none;
+  }
+
+  /* #app is positioned from visualViewport in JS rather than being 100% tall.
+     On iOS the on-screen keyboard does NOT resize the window — it shrinks the
+     visual viewport — so a 100%-height layout puts the prompt underneath the
+     keyboard, which is precisely where you are typing. */
+  #app {
+    position: fixed;
+    left: 0;
+    right: 0;
+    top: 0;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+
+  #term {
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 4px 4px 0 4px;
+  }
+  #term .xterm { height: 100%; }
+
+  #bar {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 5px;
+    padding: 5px calc(5px + env(safe-area-inset-right)) calc(5px + env(safe-area-inset-bottom)) calc(5px + env(safe-area-inset-left));
+    background: var(--bar-bg);
+    border-top: 1px solid var(--edge);
+    overflow-x: auto;
+    /* The bar must never scroll-bounce away from the keyboard. */
+    overscroll-behavior-x: contain;
+  }
+  #bar button {
+    flex: 1 1 auto;
+    min-width: 44px;       /* Apple's minimum comfortable touch target. */
+    min-height: 38px;
+    border: 1px solid var(--edge);
+    border-radius: 7px;
+    background: var(--key-bg);
+    color: var(--key-fg);
+    font: 600 14px ui-monospace, SFMono-Regular, Menlo, monospace;
+    /* Keep taps from selecting button text or firing a synthetic double-tap
+       zoom, both of which steal focus from the terminal. */
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: manipulation;
+    cursor: pointer;
+  }
+  #bar button:active { background: var(--key-active); color: #282a36; }
+  #bar button.armed {
+    background: var(--key-armed);
+    color: #282a36;
+    border-color: var(--key-armed);
+  }
+
+  #status {
+    position: fixed;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10;
+    padding: 5px 14px;
+    border-radius: 0 0 7px 7px;
+    background: #ff5555;
+    color: #282a36;
+    font-weight: 600;
+    font-size: 12px;
+    display: none;
+  }
+  #status.show { display: block; }
+
+  /* Shown only when a clipboard WRITE is refused — see the OSC 52 handler.
+     Its text is deliberately selectable, unlike the terminal's. */
+  #clip {
+    position: fixed;
+    left: 50%;
+    top: 12%;
+    transform: translateX(-50%);
+    z-index: 20;
+    width: min(90vw, 640px);
+    max-height: 60vh;
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px;
+    border: 1px solid var(--edge);
+    border-radius: 9px;
+    background: var(--bar-bg);
+  }
+  #clip.show { display: flex; }
+  #clip pre {
+    margin: 0;
+    overflow: auto;
+    max-height: 44vh;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font: 13px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--key-fg);
+    user-select: text;
+    -webkit-user-select: text;
+  }
+  #clip div { display: flex; gap: 6px; }
+  #clip button {
+    flex: 1 1 auto;
+    min-height: 38px;
+    border: 1px solid var(--edge);
+    border-radius: 7px;
+    background: var(--key-bg);
+    color: var(--key-fg);
+    font: 600 14px ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  /* Only created when the URL carries ?debug — see the dbg() comment. */
+  #debug {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 9;
+    max-height: 45%;
+    display: flex;
+    flex-direction: column;
+    background: rgba(33, 34, 44, 0.94);
+    border-bottom: 1px solid var(--key-active);
+    color: #8be9fd;
+    font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  #debug-bar {
+    display: flex;
+    gap: 6px;
+    padding: 4px 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  }
+  #debug-bar button {
+    font: inherit;
+    color: inherit;
+    background: var(--key-bg, #3a3d4d);
+    border: 0;
+    border-radius: 4px;
+    padding: 4px 10px;
+  }
+  #debug-bar span { margin-left: auto; opacity: 0.7; }
+  /* The log itself scrolls and is selectable; the trace is useless if it can't
+     leave the device. */
+  #debug-log {
+    margin: 0;
+    padding: 4px 6px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    -webkit-user-select: text;
+    user-select: text;
+  }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div id="term"></div>
+  <!-- Why these keys: the iPad on-screen keyboard has no esc, ctrl, tab or
+       arrows, and Claude Code needs esc constantly while herdr's prefix is
+       ctrl+b. Without this row the session is unusable without a hardware
+       keyboard. -->
+  <div id="bar">
+    <button data-seq="\x1b"   title="Escape">esc</button>
+    <button id="k-ctrl"       title="Control (sticky — applies to the next key)">ctrl</button>
+    <button data-seq="\t"     title="Tab">tab</button>
+    <!-- CSI Z (backtab). Its own button rather than a sticky shift because
+         shift+tab is Claude Code's mode cycle — the single most-used chord
+         here, and it should cost one tap, not two. -->
+    <button data-seq="\x1b[Z" title="Shift+Tab — cycles Claude Code's mode">&#8679;tab</button>
+    <button data-seq="\x02"   title="herdr prefix (ctrl+b)">&#8984;b</button>
+    <!-- iOS long-press paste cannot reach xterm.js's hidden textarea, so paste
+         gets a real key. Reading the clipboard needs a user gesture, which a
+         button tap is and a synthesised event is not. -->
+    <button id="k-paste"      title="Paste from the iPad clipboard">paste</button>
+    <button data-arrow="D"    title="Left">&#8592;</button>
+    <button data-arrow="B"    title="Down">&#8595;</button>
+    <button data-arrow="A"    title="Up">&#8593;</button>
+    <button data-arrow="C"    title="Right">&#8594;</button>
+  </div>
+</div>
+
+<div id="status"></div>
+<div id="clip"><pre id="clip-text"></pre><div>
+  <button type="button" id="clip-copy">Copy</button>
+  <button type="button" id="clip-close">Close</button>
+</div></div>
+
+<script>
+@@XTERM_JS@@
+</script>
+<script>
+@@XTERM_FIT@@
+</script>
+<script>
+(function () {
+  'use strict';
+
+  // The UMD builds have moved globals around across versions; accept either.
+  var TerminalCtor = window.Terminal || (window.xterm && window.xterm.Terminal);
+  var FitCtor = window.FitAddon && (window.FitAddon.FitAddon || window.FitAddon);
+  if (!TerminalCtor) {
+    document.getElementById('status').textContent = 'xterm.js failed to load';
+    document.getElementById('status').className = 'show';
+    return;
+  }
+
+  var enc = new TextEncoder();
+  var dec = new TextDecoder();
+
+  var app = document.getElementById('app');
+  var statusEl = document.getElementById('status');
+  var barEl = document.getElementById('bar');
+  var termEl = document.getElementById('term');
+
+  var ws = null;
+  var ctrlArmed = false;
+  var retries = 0;
+  var closedByUs = false;
+
+  var term = new TerminalCtor({
+    // Default (DOM) renderer on purpose. ttyd's stock frontend asks for webgl,
+    // which is unreliable on iOS Safari; DOM is fast enough for a TUI and
+    // means no extra addon bundle to inline.
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, monospace',
+    fontSize: 14,
+    lineHeight: 1.1,
+    cursorBlink: true,
+    scrollback: 2000,
+    macOptionIsMeta: true,
+    theme: {
+      background: '#282a36', foreground: '#f8f8f2', cursor: '#f8f8f2',
+      selectionBackground: '#44475a',
+      black: '#21222c',   red: '#ff5555',     green: '#50fa7b',  yellow: '#f1fa8c',
+      blue: '#bd93f9',    magenta: '#ff79c6', cyan: '#8be9fd',   white: '#f8f8f2',
+      brightBlack: '#6272a4', brightRed: '#ff6e6e', brightGreen: '#69ff94',
+      brightYellow: '#ffffa5', brightBlue: '#d6acff', brightMagenta: '#ff92df',
+      brightCyan: '#a4ffff', brightWhite: '#ffffff'
+    }
+  });
+
+  var fit = FitCtor ? new FitCtor() : null;
+  if (fit) term.loadAddon(fit);
+  term.open(termEl);
+
+  // iOS will helpfully capitalize and autocorrect your shell input unless told
+  // otherwise. xterm.js types into a hidden textarea, so the attributes go there.
+  if (term.textarea) {
+    term.textarea.setAttribute('autocorrect', 'off');
+    term.textarea.setAttribute('autocapitalize', 'off');
+    term.textarea.setAttribute('autocomplete', 'off');
+    term.textarea.setAttribute('spellcheck', 'false');
+  }
+
+  function showStatus(msg) {
+    statusEl.textContent = msg;
+    statusEl.className = 'show';
+  }
+  function hideStatus() {
+    statusEl.className = '';
+  }
+
+  // Append ?debug to the URL to get an on-screen log of the raw input events.
+  // Mobile input bugs (dictation especially) are impossible to reason about
+  // from a desk with no device, and Safari on iPadOS has no console worth
+  // reaching — so the page can show its own event trace. Inert otherwise.
+  //
+  // The log is kept whole, in order, with a Copy button, because the earlier
+  // version of this pane could not answer the question it existed for: it held
+  // sixteen lines newest-first and was pointer-events:none, so a dictation long
+  // enough to misbehave had already scrolled its own beginning away and none of
+  // it could be selected off an iPad. Timestamps are relative to the first
+  // event — the gap before the mic-off echo is often the whole story.
+  var dbgLog = [];
+  var dbgEl = null, dbgOutEl = null, dbgT0 = 0;
+  if (/(^|[?&])debug\b/.test(location.search)) {
+    dbgEl = document.createElement('div');
+    dbgEl.id = 'debug';
+    dbgEl.innerHTML =
+      '<div id="debug-bar">' +
+        '<button type="button" data-dbg="copy">Copy</button>' +
+        '<button type="button" data-dbg="send">Send</button>' +
+        '<button type="button" data-dbg="clear">Clear</button>' +
+        '<button type="button" data-dbg="hide">Hide</button>' +
+        '<span id="debug-count">0</span>' +
+      '</div><pre id="debug-log"></pre>';
+    document.body.appendChild(dbgEl);
+    dbgOutEl = dbgEl.querySelector('#debug-log');
+    dbgEl.querySelector('#debug-bar').addEventListener('click', function (ev) {
+      var what = ev.target.getAttribute('data-dbg');
+      if (!what) return;
+      if (what === 'copy') {
+        var text = dbgLog.join('\n');
+        // Safari only allows this from inside the gesture, and only over HTTPS
+        // — which the tailscale serve endpoint is. Fall back to selecting the
+        // log so it can still be copied by hand.
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            ev.target.textContent = 'Copied';
+            setTimeout(function () { ev.target.textContent = 'Copy'; }, 1200);
+          }, selectDbgLog);
+        } else {
+          selectDbgLog();
+        }
+      } else if (what === 'send') {
+        // Hands the trace straight to the box instead of across an iPad's
+        // clipboard and into another app. Needs a /dbg endpoint proxied
+        // alongside this page; where there isn't one this fails visibly and
+        // Copy still works.
+        ev.target.textContent = 'Sending…';
+        fetch('/dbg', { method: 'POST', body: dbgLog.join('\n') }).then(function (r) {
+          ev.target.textContent = r.ok ? 'Sent' : 'Failed ' + r.status;
+        }, function () {
+          ev.target.textContent = 'Failed';
+        });
+        setTimeout(function () { ev.target.textContent = 'Send'; }, 2500);
+      } else if (what === 'clear') {
+        dbgLog.length = 0;
+        dbgT0 = 0;
+        renderDbg();
+      } else if (what === 'hide') {
+        dbgEl.style.display = 'none';
+      }
+      term.focus();
+    });
+  }
+  function selectDbgLog() {
+    var r = document.createRange();
+    r.selectNodeContents(dbgOutEl);
+    var sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+  function renderDbg() {
+    dbgOutEl.textContent = dbgLog.join('\n');
+    dbgEl.querySelector('#debug-count').textContent = dbgLog.length;
+    dbgOutEl.scrollTop = dbgOutEl.scrollHeight;
+  }
+  function dbg() {
+    if (!dbgEl) return;
+    var now = Date.now();
+    if (!dbgT0) dbgT0 = now;
+    dbgLog.push('+' + String(now - dbgT0) + 'ms ' +
+                Array.prototype.join.call(arguments, ' '));
+    renderDbg();
+  }
+
+  function send(str) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(enc.encode('0' + str));
+  }
+
+  function sendResize() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(enc.encode('1' + JSON.stringify({ columns: term.cols, rows: term.rows })));
+    }
+  }
+
+  // --- layout ------------------------------------------------------------
+  // Drive the layout off visualViewport so the prompt and the key bar stay
+  // above the on-screen keyboard. See the #app comment in the stylesheet.
+  function layout() {
+    var vv = window.visualViewport;
+    if (vv) {
+      app.style.height = vv.height + 'px';
+      app.style.top = vv.offsetTop + 'px';
+    } else {
+      app.style.height = '100%';
+      app.style.top = '0';
+    }
+    if (fit) {
+      try { fit.fit(); } catch (e) { /* pre-open / zero-size; harmless */ }
+    }
+    sendResize();
+  }
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', layout);
+    window.visualViewport.addEventListener('scroll', layout);
+  }
+  window.addEventListener('resize', layout);
+  window.addEventListener('orientationchange', function () { setTimeout(layout, 150); });
+
+  // --- key bar -----------------------------------------------------------
+  function setCtrl(on) {
+    ctrlArmed = on;
+    document.getElementById('k-ctrl').classList.toggle('armed', on);
+  }
+
+  // Control chars are the low 5 bits of the uppercased ASCII letter: ctrl+c is
+  // 0x43 & 0x1f = 0x03. Covers @ A-Z [ \ ] ^ _ , which is every ctrl sequence a
+  // terminal can carry.
+  function toCtrl(ch) {
+    var code = ch.toUpperCase().charCodeAt(0);
+    if (code >= 64 && code <= 95) return String.fromCharCode(code & 0x1f);
+    if (ch === ' ') return '\x00';
+    if (ch === '?') return '\x7f';
+    return null;
+  }
+
+  // Arrow keys differ between normal and application cursor mode (DECCKM):
+  // CSI A vs SS3 A. Full-screen TUIs commonly switch the mode on, so read it
+  // from xterm.js instead of hardcoding one form. A held modifier forces the
+  // CSI form with a parameter (CSI 1 ; 5 A = ctrl+up) — SS3 has nowhere to put
+  // one, so ctrl+arrow for word-jump only works via CSI.
+  function arrowSeq(letter, ctrl) {
+    if (ctrl) return '\x1b[1;5' + letter;
+    var appMode = term.modes && term.modes.applicationCursorKeysMode;
+    return (appMode ? '\x1bO' : '\x1b[') + letter;
+  }
+
+  barEl.addEventListener('click', function (ev) {
+    var btn = ev.target.closest('button');
+    if (!btn) return;
+
+    if (btn.id === 'k-ctrl') {
+      setCtrl(!ctrlArmed);
+      term.focus();
+      return;
+    }
+
+    if (btn.id === 'k-paste') {
+      pasteFromClipboard(btn);
+      closePhrase();
+      term.focus();
+      return;
+    }
+
+    var arrow = btn.getAttribute('data-arrow');
+    if (arrow) {
+      send(arrowSeq(arrow, ctrlArmed));
+    } else {
+      var raw = btn.getAttribute('data-seq');
+      if (raw !== null) {
+        // data-seq carries \xNN / \t escapes literally in the HTML; unescape.
+        send(raw.replace(/\\x([0-9a-fA-F]{2})/g, function (_, h) {
+          return String.fromCharCode(parseInt(h, 16));
+        }).replace(/\\t/g, '\t'));
+      }
+    }
+    // Any bar key moves the cursor or the line, so a dictation correction must
+    // not reach back past it.
+    closePhrase();
+
+    // A sticky ctrl applies to the next key whatever its source, including
+    // these buttons — ctrl then the left arrow is a real chord.
+    if (ctrlArmed) setCtrl(false);
+    term.focus();
+  });
+
+  // Tapping the terminal should raise the keyboard.
+  termEl.addEventListener('click', function () { term.focus(); });
+
+  // --- touch scrolling ---------------------------------------------------
+  // herdr turns mouse reporting on, and xterm.js disables its own touch
+  // scrolling whenever an application has done that:
+  //
+  //   addDisposableDomListener(el, 'touchstart', e => {
+  //     if (!this.coreMouseService.areMouseEventsActive) ... viewport scroll
+  //
+  // The reasoning is sound on a desktop — the application asked for the mouse,
+  // so the mouse belongs to it — but on an iPad it means a drag does nothing at
+  // all. Safari synthesises click-ish mouse events for a TAP, which is why
+  // tapping a pane still focuses it, but it synthesises nothing for a drag, so
+  // no wheel event is ever generated and neither xterm.js nor herdr sees the
+  // gesture.
+  //
+  // So generate it. A drag becomes wheel events, dispatched at the finger, and
+  // everything downstream is then the code that already exists: xterm.js
+  // encodes them in whatever mouse protocol is actually active and herdr
+  // scrolls the pane under them, exactly as it would for a real wheel. Nothing
+  // here knows what SGR is, and nothing has to be kept in step with the
+  // protocol herdr chooses.
+  var touchX = 0, touchY = 0, touchAccum = 0, touchOwned = false, touchScrolled = false;
+
+  // Row height in CSS pixels, measured rather than assumed: font size, line
+  // height and the iPad's own scaling all move it, and one wheel event per row
+  // is what makes the drag track the finger.
+  function rowHeight() {
+    var screen = term.element && term.element.querySelector('.xterm-screen');
+    var h = screen ? screen.getBoundingClientRect().height : 0;
+    return (h && term.rows) ? h / term.rows : 17;
+  }
+
+  function wheelAt(deltaY, x, y) {
+    if (!term.element) return;
+    term.element.dispatchEvent(new WheelEvent('wheel', {
+      deltaY: deltaY,
+      deltaMode: 1,            // DOM_DELTA_LINE: one row, not one pixel.
+      clientX: x, clientY: y,  // Which pane herdr scrolls is read from these.
+      bubbles: true, cancelable: true
+    }));
+  }
+
+  termEl.addEventListener('touchstart', function (ev) {
+    // Only a one-finger drag. Two fingers are a pinch, and taking those over
+    // would break zooming for no gain.
+    touchOwned = ev.touches.length === 1 &&
+                 term.modes && term.modes.mouseTrackingMode !== 'none';
+    touchScrolled = false;
+    touchAccum = 0;
+    if (touchOwned) { touchX = ev.touches[0].clientX; touchY = ev.touches[0].clientY; }
+  }, { passive: true });
+
+  termEl.addEventListener('touchmove', function (ev) {
+    if (!touchOwned || ev.touches.length !== 1) return;
+    var t = ev.touches[0];
+    touchAccum += t.clientY - touchY;
+    touchX = t.clientX;
+    touchY = t.clientY;
+
+    // Below one row of travel there is nothing to send yet, but the gesture is
+    // already clearly a drag rather than a tap, so stop Safari rubber-banding
+    // the page underneath it.
+    if (touchScrolled || Math.abs(touchAccum) > 6) ev.preventDefault();
+
+    var h = rowHeight();
+    var rows = (touchAccum / h) | 0;
+    if (!rows) return;
+    touchAccum -= rows * h;
+    touchScrolled = true;
+    // Dragging DOWN reveals earlier output, which is a wheel scrolled UP.
+    var step = rows > 0 ? -1 : 1;
+    var n = Math.min(Math.abs(rows), 24);   // ceiling on one flung gesture
+    for (var i = 0; i < n; i++) wheelAt(step, t.clientX, t.clientY);
+  }, { passive: false });
+
+  // --- clipboard ---------------------------------------------------------
+  // Two separate problems wearing one costume. Neither is solvable by making
+  // iOS's long-press menu work over the pane: xterm.js sets `user-select: none`
+  // on .xterm unconditionally, and with mouse reporting on it also disables its
+  // own selection layer, so there is nothing under a long press to select.
+  // herdr owns the scrollback and its own copy mode, so the answer is to carry
+  // text in and out across that boundary instead.
+
+  var clipEl = document.getElementById('clip');
+  var clipTextEl = document.getElementById('clip-text');
+
+  function showClipFallback(text) {
+    clipTextEl.textContent = text;
+    clipEl.classList.add('show');
+  }
+  document.getElementById('clip-close').addEventListener('click', function () {
+    clipEl.classList.remove('show');
+    term.focus();
+  });
+  document.getElementById('clip-copy').addEventListener('click', function (ev) {
+    // Inside a real tap, so Safari allows the write that failed on arrival.
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(clipTextEl.textContent).then(function () {
+        clipEl.classList.remove('show');
+        term.focus();
+      }, function () { ev.target.textContent = 'Select above and copy'; });
+    } else {
+      ev.target.textContent = 'Select above and copy';
+    }
+  });
+
+  // OUT: herdr already reports a copy-mode yank as OSC 52, the standard way a
+  // terminal application hands text to its host's clipboard. xterm.js has no
+  // handler for it in core, so until now those writes went nowhere — copying
+  // inside herdr looked like it worked and put nothing on the iPad.
+  if (term.parser && term.parser.registerOscHandler) {
+    term.parser.registerOscHandler(52, function (data) {
+      var semi = data.indexOf(';');
+      if (semi < 0) return true;
+      var payload = data.slice(semi + 1);
+      // "?" is a READ request — the sequence's other half, which lets a remote
+      // application ask for the clipboard's contents. Refused: this endpoint is
+      // an unauthenticated shell, and silently handing it whatever the person
+      // last copied on their iPad is not a trade worth making.
+      if (payload === '?') return true;
+      var text;
+      try {
+        var bytes = atob(payload);
+        var buf = new Uint8Array(bytes.length);
+        for (var i = 0; i < bytes.length; i++) buf[i] = bytes.charCodeAt(i);
+        text = new TextDecoder().decode(buf);
+      } catch (e) { return true; }
+      if (!text) return true;
+      // The write arrives on output, not on a tap, so Safari may refuse it as
+      // untrusted. Fall back to showing the text where it CAN be copied.
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(null, function () { showClipFallback(text); });
+      } else {
+        showClipFallback(text);
+      }
+      return true;
+    });
+  }
+
+  // IN: reading the clipboard requires a user gesture, so this runs from the
+  // key bar's own tap handler and nowhere else. term.paste applies bracketed
+  // paste when herdr has asked for it, which is what keeps a multi-line paste
+  // one paste instead of a run of Enters.
+  function pasteFromClipboard(btn) {
+    function failed(msg) {
+      btn.textContent = msg;
+      setTimeout(function () { btn.textContent = 'paste'; }, 2000);
+    }
+    if (!navigator.clipboard || !navigator.clipboard.readText) return failed('no clip');
+    navigator.clipboard.readText().then(function (text) {
+      if (text) term.paste(text);
+      term.focus();
+    }, function () { failed('denied'); });
+  }
+
+  // --- dictation ---------------------------------------------------------
+  // iOS voice-to-text does not deliver a phrase once, or even twice. It
+  // rewrites the WHOLE phrase into xterm.js's hidden textarea over and over as
+  // the recognizer firms it up, and each rewrite reaches us as a fresh onData
+  // chunk measured from the start of the phrase. Saying "hello world" emits
+  //
+  //   "hel" -> "hello" -> "hello world" -> "hello world"
+  //
+  // and the pane shows "helhellohello worldhello world".
+  //
+  // Two earlier attempts failed on the same wrong premise — that the phrase
+  // arrives as exactly two copies:
+  //   * dropping an exact repeat of the last-delivered phrase removes only the
+  //     final duplicate and leaves every partial standing, and
+  //   * suppressing onData for the duration of the composition and sending
+  //     ev.data from the `input` event instead broke the client outright,
+  //     because iOS fires `input` for every partial too, not just once after
+  //     compositionend.
+  //
+  // So treat the chunks as what they are: successive snapshots of one growing
+  // phrase, and forward only what each snapshot ADDS to the one before it. The
+  // partials stop being duplicates and become the phrase arriving in pieces.
+  //
+  // Nothing here gates on composition events. They are logged for debugging and
+  // that is all — iOS does not reliably fire compositionend for dictation (the
+  // 800ms `lastComposedAt` guard in the first version is why its dedupe never
+  // fired at all), and a rule that silently does nothing when an event fails to
+  // arrive is how this bug survived two fixes. The snapshot rule below stands on
+  // the shape of the data instead, so it works either way.
+  if (term.textarea) {
+    term.textarea.addEventListener('compositionstart', function () { dbg('compositionstart'); });
+    term.textarea.addEventListener('compositionend', function (ev) {
+      dbg('compositionend', JSON.stringify(ev.data));
+    });
+    term.textarea.addEventListener('input', function (ev) {
+      dbg('input', ev.inputType + ' ' + JSON.stringify(ev.data) +
+          ' ta=' + JSON.stringify(term.textarea.value));
+    });
+  }
+
+  // --- input -------------------------------------------------------------
+  // A phrase in flight is closed by an editing key, never by a timer: iOS keeps
+  // accumulating into the SAME buffer when dictation is stopped and restarted
+  // mid-sentence, and those pauses are paced by a person — thinking mid-sentence
+  // outlasts any timeout short enough to tell two phrases apart. So this bound
+  // is staleness hygiene only, deliberately far longer than any pause in speech.
+  // What actually keeps a correction safe is the same-words test and
+  // MAX_REWRITE below, not the clock.
+  var PHRASE_IDLE_MS = 300000;
+  // Absolute ceiling on a single correction. SAME_UTTERANCE below is what
+  // actually decides whether to rewrite; this is a last-ditch sanity limit, set
+  // above the length of any sentence someone is likely to dictate in one go.
+  // Past it the snapshot is re-sent whole, because a visible duplicate is
+  // recoverable by hand and a line erased on a bad guess is not.
+  var MAX_REWRITE = 400;
+  // How much of the phrase already delivered must survive, in order, inside the
+  // new snapshot for it to count as the same utterance being restated. Measured
+  // over three iPad traces, real revisions score 80-100% and unrelated phrases
+  // 27-37%, so this sits in a wide empty gap rather than on a boundary.
+  var SAME_UTTERANCE = 0.7;
+  // Skip the similarity test rather than run it over a huge paste; the cheap
+  // prefix test stands in. n*m cells, and a dictated sentence is a few hundred
+  // characters at most.
+  var MAX_SIMILARITY_WORK = 250000;
+  var phraseSent = '';   // the dictated text delivered for the phrase in flight
+  // Single characters delivered after it, kept apart from the phrase rather than
+  // folded into it. Both a person typing and dictation committing its trailing
+  // space or full stop arrive this way and cannot be told apart at the time, so
+  // they are not told apart: they are simply remembered, held out of the
+  // similarity test, and re-typed after any correction that erases them. That
+  // way a keystroke is never rewritten and never lost, and — the part a timer got
+  // wrong — a trailing character committed long after the words it belongs to
+  // still leaves the phrase standing for the echo behind it.
+  var typedTail = '';
+  var phraseAt = 0;
+
+  // Anything that moves the cursor somewhere a correction cannot safely reach
+  // back across ends the phrase. The key bar calls this too: its arrows, tab and
+  // escape bypass onData entirely, and a correction issued after one would
+  // backspace from wherever the cursor now is, eating text nobody dictated.
+  function closePhrase() {
+    if (phraseSent || typedTail) dbg('.. phrase closed');
+    phraseSent = '';
+    typedTail = '';
+  }
+
+  function commonPrefixLen(a, b) {
+    var n = Math.min(a.length, b.length), i = 0;
+    while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+    return i;
+  }
+
+  // Same, ignoring case, and index-aligned with the raw strings so the result
+  // can still be used as an offset into either. Case is worth ignoring here
+  // because iOS capitalises a word it has already sent — "i'm Dicked" becoming
+  // "i'm dictating" diverges at the D, which drags the literal common prefix
+  // down to 4 characters when 7 of them really do agree.
+  function commonPrefixLenLoose(a, b) {
+    var n = Math.min(a.length, b.length), i = 0;
+    while (i < n && (a.charCodeAt(i) === b.charCodeAt(i) ||
+                     a.charAt(i).toLowerCase() === b.charAt(i).toLowerCase())) i++;
+    return i;
+  }
+
+  // How much of `held` survives, in order, inside `next` — the length of their
+  // longest common subsequence, over `held`.
+  //
+  // This replaced a prefix ratio, which measured agreement only up to the first
+  // difference and so collapsed on exactly the case that motivated it: iOS
+  // deleting a word from the MIDDLE of a sentence it had already sent. One
+  // measured trace dropped to 27% agreement because a word vanished at character
+  // 52 of 192, while 95% of the sentence was untouched. A subsequence does not
+  // stop at the first difference, so an edit anywhere costs only what it
+  // actually changed.
+  //
+  // Case is folded because iOS recapitalises words it has already committed.
+  // Two rolling rows rather than a full matrix: this runs on every snapshot.
+  function survivingFraction(held, next) {
+    if (!held) return 0;
+    if (held.length * next.length > MAX_SIMILARITY_WORK) {
+      return commonPrefixLenLoose(held, next) / held.length;
+    }
+    var a = held.toLowerCase(), b = next.toLowerCase();
+    var prev = new Uint16Array(b.length + 1);
+    var cur = new Uint16Array(b.length + 1);
+    for (var i = 0; i < a.length; i++) {
+      var ca = a.charCodeAt(i);
+      for (var j = 0; j < b.length; j++) {
+        cur[j + 1] = ca === b.charCodeAt(j)
+          ? prev[j] + 1
+          : (prev[j + 1] > cur[j] ? prev[j + 1] : cur[j]);
+      }
+      var swap = prev; prev = cur; cur = swap;
+      cur[0] = 0;
+    }
+    return prev[b.length] / held.length;
+  }
+
+  function handleInput(data, now) {
+    // A chunk beginning with ESC is a terminal control sequence, never speech —
+    // an arrow key, a function key, or the one that did the damage here: a mouse
+    // report. The pane has mouse tracking on, so every touch and drag on an iPad
+    // emits ESC[<35;col;rowm through this same callback, and the phrase logic
+    // was reading them as dictation. Consecutive reports share the "ESC[<35;"
+    // prefix, which lands either side of KEEP_RATIO depending on the coordinate
+    // digits, so some pairs were "corrected" into each other with backspaces —
+    // hence half-eaten reports in the pane, and a stray "m" landing in the middle
+    // of typed text. Worse, a report between two dictation snapshots replaced the
+    // phrase outright, so reaching for the microphone button was itself enough to
+    // make the echo that followed look like new speech and duplicate.
+    if (data.length > 1 && data.charCodeAt(0) === 0x1b) {
+      // Pointer MOTION leaves the cursor exactly where it was, so it must not
+      // disturb a phrase in flight — that is the whole point. A button press or
+      // release can move it, so that ends the phrase. Bit 32 of the SGR button
+      // field marks motion.
+      var mouse = /^\x1b\[<(\d+);/.exec(data);
+      if (!mouse || !(parseInt(mouse[1], 10) & 32)) closePhrase();
+      dbg('>> control', JSON.stringify(data));
+      send(data);
+      return;
+    }
+
+    // Only whole phrases are ever coalesced. Single characters are ordinary
+    // keystrokes and must never touch this path — "ll" typed by hand, or a held
+    // key repeating, is not a dictation snapshot.
+    if (data.length > 1) {
+      // Nothing to do at all: the phrase over again, unchanged. Checked first so
+      // an echo never disturbs characters sitting behind it.
+      if (data === phraseSent) {
+        phraseAt = now;
+        dbg('>> (repeat suppressed)');
+        return;
+      }
+
+      // Does the tail belong to this utterance or not? Dictation's own trailing
+      // characters come back inside the next snapshot; a person's keystrokes
+      // never do. Rather than guess from timing — which is what a 1500ms window
+      // got wrong, closing a phrase whenever someone paused before reaching for
+      // the microphone — score the snapshot both ways and let the measure say.
+      // Including the tail costs nothing when it is part of the utterance and
+      // costs a character when it was typed, so the higher score is the answer.
+      // A phrase seeded from single characters falls out of the same comparison:
+      // one trace opened with the lone letter "O", and scoring against "" gives
+      // it nothing to beat.
+      var delivered = phraseSent + typedTail;
+      var sDelivered = delivered ? survivingFraction(delivered, data) : 0;
+      var sPhrase = phraseSent ? survivingFraction(phraseSent, data) : 0;
+      var tailIsSpeech = sDelivered >= sPhrase;
+      var base = tailIsSpeech ? delivered : phraseSent;
+      var tail = tailIsSpeech ? '' : typedTail;
+      var survives = tailIsSpeech ? sDelivered : sPhrase;
+
+      // Is this snapshot the utterance we are already delivering, restated?
+      // Ask it as one question — how much of what we already sent still stands,
+      // in order — rather than trying to classify the kind of change. iOS
+      // revises along every axis at once: it re-punctuates and recapitalises
+      // committed text, re-recognises whole words ("Dicked" -> "dictating"), and
+      // deletes words from the middle of a sentence it already sent. Rules aimed
+      // at each axis kept letting the next one through.
+      if (base && now - phraseAt < PHRASE_IDLE_MS && survives >= SAME_UTTERANCE) {
+        // Same utterance, restated. Bring the pane from what we last sent to
+        // this snapshot: back over the characters that changed, then type the
+        // rest. Both are true of a plain extension too — nothing to erase, tail
+        // to add — so growth and revision are one case, not two.
+        //
+        // A typed tail sits between the cursor and the text being corrected, so
+        // it comes off and goes back on. It is re-typed rather than dropped:
+        // this rewrites dictation, never a keystroke.
+        var k = commonPrefixLen(base, data);
+        var erase = (base.length - k) + tail.length;
+        var add = data.slice(k) + tail;
+        if (erase <= MAX_REWRITE) {
+          phraseAt = now;
+          phraseSent = data;
+          typedTail = tail;
+          if (!erase && !add) { dbg('>> (repeat suppressed)'); return; }
+          dbg('>> patch', 'erase=' + erase, 'survives=' + Math.round(survives * 100) + '%',
+              JSON.stringify(data.slice(k)));
+          // One write: a half-applied correction is a visibly mangled line.
+          send(new Array(erase + 1).join('\x7f') + add);
+          return;
+        }
+        dbg('!! rewrite too large', 'erase=' + erase);
+      }
+      // A different utterance, or a correction too large to trust. Pass it
+      // through whole and start a new phrase here. The asymmetry is deliberate
+      // and unchanged from the first version — a visible duplicate is
+      // recoverable, and so is a stray phrase; speech swallowed on a guess, or
+      // a line erased on one, is not.
+      dbg('.. new phrase', 'survives=' + Math.round(survives * 100) + '%');
+      phraseSent = data;
+      typedTail = '';
+      phraseAt = now;
+    } else if (ctrlArmed || data.charCodeAt(0) < 0x20 || data === '\x7f') {
+      // Enter, Tab, Escape, backspace, a ctrl chord: the pane's line state moves
+      // somewhere a correction cannot reach back across, so the phrase is over.
+      // This is what stops the next dictation being measured against a stale
+      // phrase, and what bounds the repeat rule — press Enter and the next
+      // identical phrase is sent rather than swallowed.
+      closePhrase();
+    } else {
+      // A single character: a keystroke, or dictation committing its trailing
+      // space or full stop. Remembered either way, so a correction can put it
+      // back, and so a phrase is never closed by one arriving late.
+      dbg('.. tail', JSON.stringify(data));
+      typedTail += data;
+      phraseAt = now;
+    }
+
+    if (ctrlArmed && data.length === 1) {
+      var c = toCtrl(data);
+      setCtrl(false);
+      if (c !== null) { send(c); return; }
+    }
+    dbg('>> whole', JSON.stringify(data));
+    send(data);
+  }
+
+  // iOS does not stop at restating the phrase. When dictation is switched OFF it
+  // REPLAYS the whole sentence word by word — 83 separate chunks in one measured
+  // trace, alternating word and space — and each word, seen alone, is a fragment
+  // with nothing in common with the phrase held against it. The logic below
+  // faithfully appended all 83 of them, retyping the sentence underneath itself.
+  //
+  // The replay is not ambiguous, though: it arrives on a metronome. Across four
+  // traces the gaps inside a replay never exceed 58ms, while consecutive speech
+  // snapshots are never closer than 325ms — two clouds with an empty gap between
+  // them, so the window below sits in open space rather than on a boundary.
+  // Gather anything arriving that fast into one chunk, and the replay stops
+  // being 83 unrelated fragments and becomes one recognisable thing.
+  //
+  // What to DO with it is settled by the traces too, and not the way it first
+  // looks. The replay is not merely redundant — it is LOSSY. Reconstructed from
+  // the four captured sessions, the live text is complete every time and the
+  // replay behind it has words missing from the middle: "pausing between
+  // sentences or" came back as "pausing between  or", and "while I pause to get
+  // my thoughts" as "while I  my thoughts". So the replay is not a better final
+  // answer to be patched in — it is strictly worse than what the pane already
+  // shows, and the right thing to do with it is nothing at all.
+  var BURST_MS = 120;
+  var pending = '';
+  var pendingTimer = null;
+  // How many chunks went into `pending`, and how many of those were appended as
+  // fragments rather than replacing it as a restatement. Both are needed to tell
+  // a replay from speech that merely came in fast: the captured trace opens with
+  // "i'" and "i'm" 40ms apart, which is two chunks inside the window but zero
+  // fragments — each restates the other. A replay is dozens of fragments, and
+  // even the shortest possible one ("hello", " ", "world") is three chunks and
+  // two joins. Requiring both keeps a fast pair of snapshots out of the drop
+  // rule below, which matters because dropping one of those would lose speech
+  // that nothing later restores.
+  var pendingParts = 0;
+  var pendingJoins = 0;
+
+  // Two chunks arriving close together are not necessarily two pieces of one
+  // thing. Speech snapshots are cumulative and can come fast — the captured
+  // trace opens with "i'" and "i'm" only 40ms apart — so appending blindly
+  // spells "i'i'm". A replay chunk, by contrast, genuinely continues the one
+  // before it. Which is which is the same question asked of every snapshot, so
+  // ask it the same way: a chunk that restates what is buffered replaces it, and
+  // one that has nothing to do with it is a fragment and follows it.
+  function mergePending(next) {
+    if (!pending) return next;
+    if (survivingFraction(pending, next) >= SAME_UTTERANCE) return next;
+    pendingJoins++;
+    return pending + next;
+  }
+
+  function flushPending() {
+    if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+    if (!pending) return;
+    var chunk = pending, parts = pendingParts, joins = pendingJoins;
+    pending = ''; pendingParts = 0; pendingJoins = 0;
+    if (parts > 1) dbg('== coalesced', parts + ' chunks', JSON.stringify(chunk));
+
+    // A burst assembled out of fragments that adds up to the sentence already on
+    // screen is the mic-off replay. Drop it: the pane is already correct, and
+    // the replay is the lossier of the two texts. Nothing is erased and nothing
+    // is typed, so a false positive here costs one snapshot of lag and the next
+    // cumulative snapshot repairs it — the same asymmetry the rest of this code
+    // is built on, where a visible duplicate is recoverable and swallowed speech
+    // is not.
+    if (parts > 2 && joins > 1 && phraseSent) {
+      var s = survivingFraction(phraseSent, chunk);
+      if (s >= SAME_UTTERANCE) {
+        phraseAt = Date.now();
+        dbg('>> (replay dropped)', parts + ' chunks',
+            'survives=' + Math.round(s * 100) + '%');
+        return;
+      }
+    }
+    handleInput(chunk, Date.now());
+  }
+
+  term.onData(function (data) {
+    dbg('<<', JSON.stringify(data), 'held=' + phraseSent.length +
+        (typedTail ? '+' + typedTail.length : ''));
+
+    // Control sequences are not text and must keep their place in the stream, so
+    // they go out immediately, after anything waiting.
+    if (data.length > 1 && data.charCodeAt(0) === 0x1b) {
+      flushPending();
+      handleInput(data, Date.now());
+      return;
+    }
+
+    // A lone keystroke with nothing waiting goes straight out: typing must not
+    // pay the coalescing delay. Once something IS waiting, everything joins it —
+    // the replay puts its spaces through as single characters, and letting those
+    // jump the queue would break the burst back into pieces.
+    if (!pending && data.length === 1) {
+      handleInput(data, Date.now());
+      return;
+    }
+
+    pending = mergePending(data);
+    pendingParts++;
+    if (pendingTimer) clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(flushPending, BURST_MS);
+  });
+
+  term.onResize(sendResize);
+
+  // --- connection --------------------------------------------------------
+  function wsUrl() {
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    // Relative to pathname so a ttyd --base-path still works.
+    return proto + location.host + location.pathname.replace(/\/?$/, '/') + 'ws';
+  }
+
+  function connect() {
+    hideStatus();
+
+    // Two live sockets would send every keystroke twice and echo everything
+    // twice, which looks exactly like an input bug. The token fetch below is
+    // async, so without this guard an overlapping reconnect can leave one
+    // behind.
+    if (ws) {
+      var stale = ws;
+      ws = null;
+      try { stale.onclose = null; stale.onmessage = null; stale.close(); } catch (e) { /* already gone */ }
+    }
+
+    fetch('token', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : { token: '' }; })
+      .catch(function () { return { token: '' }; })
+      .then(function (j) {
+        var sock = new WebSocket(wsUrl(), ['tty']);
+        sock.binaryType = 'arraybuffer';
+        ws = sock;
+
+        sock.onopen = function () {
+          retries = 0;
+          hideStatus();
+          sock.send(enc.encode(JSON.stringify({
+            AuthToken: (j && j.token) || '',
+            columns: term.cols,
+            rows: term.rows
+          })));
+          layout();
+          term.focus();
+        };
+
+        sock.onmessage = function (ev) {
+          var buf = new Uint8Array(ev.data);
+          if (!buf.length) return;
+          var cmd = String.fromCharCode(buf[0]);
+          var body = buf.subarray(1);
+          if (cmd === '0') {
+            term.write(dec.decode(body));
+          } else if (cmd === '1') {
+            document.title = dec.decode(body);
+          }
+          // '2' is ttyd's preferences blob; ours are set in the Terminal
+          // constructor above, so there is nothing to apply.
+        };
+
+        sock.onclose = function () {
+          ws = null;
+          if (closedByUs) return;
+          // herdr's server outlives the client, so a dropped socket means the
+          // PTY's herdr client exited (or the network blinked) — reconnecting
+          // re-attaches to the same persistent session.
+          retries += 1;
+          if (retries > 10) {
+            showStatus('disconnected — reload to reconnect');
+            return;
+          }
+          var delay = Math.min(1000 * retries, 5000);
+          showStatus('reconnecting…');
+          setTimeout(connect, delay);
+        };
+
+        sock.onerror = function () { showStatus('connection error'); };
+      });
+  }
+
+  window.addEventListener('pagehide', function () { closedByUs = true; });
+
+  layout();
+  connect();
+})();
+</script>
+</body>
+</html>

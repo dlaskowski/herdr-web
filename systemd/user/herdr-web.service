@@ -1,0 +1,28 @@
+[Unit]
+Description=herdr in the browser — ttyd (:7681) fronted by tailscale serve (:8444)
+After=network-online.target
+
+[Service]
+# --interface 127.0.0.1 is the security property of this whole service:
+# ttyd proxies fine from loopback, so `tailscale serve` is the ONLY route in.
+# This endpoint is an interactive shell — do not widen this bind.
+#
+# --writable is required: ttyd 1.7 is read-only unless asked.
+#
+# --index points at the GENERATED page, not the repo template
+# (bridge/herdr-web.html.in). scripts/install.sh inlines xterm.js
+# into it, because ttyd's --index takes a single self-contained file and will
+# not serve sibling assets.
+ExecStart=/usr/bin/ttyd \
+  --interface 127.0.0.1 \
+  --port 7681 \
+  --writable \
+  --index %h/.local/share/herdr-web/index.html \
+  --client-option disableLeaveAlert=true \
+  --client-option titleFixed=herdr \
+  %h/.local/bin/herdr
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
