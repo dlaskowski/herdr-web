@@ -218,17 +218,17 @@
 <div id="app">
   <div id="term"></div>
   <!-- Why these keys: the iPad on-screen keyboard has no esc, ctrl, tab or
-       arrows, and Claude Code needs esc constantly while herdr's prefix is
-       ctrl+b. Without this row the session is unusable without a hardware
+       arrows, and the AI coding agent needs esc constantly while herdr's prefix
+       is ctrl+b. Without this row the session is unusable without a hardware
        keyboard. -->
   <div id="bar">
     <button data-seq="\x1b"   title="Escape">esc</button>
     <button id="k-ctrl"       title="Control (sticky — applies to the next key)">ctrl</button>
     <button data-seq="\t"     title="Tab">tab</button>
     <!-- CSI Z (backtab). Its own button rather than a sticky shift because
-         shift+tab is Claude Code's mode cycle — the single most-used chord
+         shift+tab is the AI coding agent's mode cycle — the single most-used chord
          here, and it should cost one tap, not two. -->
-    <button data-seq="\x1b[Z" title="Shift+Tab — cycles Claude Code's mode">&#8679;tab</button>
+    <button data-seq="\x1b[Z" title="Shift+Tab — cycles agent mode">&#8679;tab</button>
     <button data-seq="\x02"   title="herdr prefix (ctrl+b)">&#8984;b</button>
     <!-- iOS long-press paste cannot reach xterm.js's hidden textarea, so paste
          gets a real key. Reading the clipboard needs a user gesture, which a

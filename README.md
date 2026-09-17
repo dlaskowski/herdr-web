@@ -52,11 +52,11 @@ Installation
 ------------
 
   1. Clone or download this package to your machine:
-       git clone <repo> ~/jarvis-setup
+       git clone <repo> ~/.local/share/herdr-web-installer
      (or extract the tarball and note the directory path)
 
   2. Run the installer:
-       bash ~/jarvis-setup/scripts/96-install-herdr-web.sh
+       bash ~/.local/share/herdr-web-installer/scripts/install.sh
 
      The script does all of the following automatically:
        * Installs ttyd via dnf (if not already present)
@@ -95,7 +95,7 @@ Updating the page
 -----------------
 
   If you edit bridge/herdr-web.html.in, re-run the installer script:
-    bash ~/jarvis-setup/scripts/96-install-herdr-web.sh
+    bash ~/.local/share/herdr-web-installer/scripts/install.sh
 
   ttyd serves the GENERATED page (~/.local/share/herdr-web/index.html),
   not the repo copy, so edits alone don't change the running page.
