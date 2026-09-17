@@ -135,7 +135,7 @@ Security notes
 File layout
 -----------
 
-  scripts/96-install-herdr-web.sh    — installer (run once)
+  scripts/install.sh                 — installer (run once)
   bridge/herdr-web.html.in           — page template
   systemd/user/herdr-web.service     — systemd unit
   ~/.local/share/herdr-web/index.html — generated page (do not edit)
