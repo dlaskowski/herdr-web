@@ -1,5 +1,5 @@
 [Unit]
-Description=herdr in the browser — ttyd (:7681) fronted by tailscale serve (:8444)
+Description=herdr in the browser — ttyd (:7681) fronted by tailscale serve
 After=network-online.target
 
 [Service]

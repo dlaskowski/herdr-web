@@ -18,7 +18,16 @@ set -euo pipefail
 BUNDLE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 PORT=7681          # ttyd, loopback only
-TAILNET_PORT=8444  # see the comment in the tailscale serve section — load-bearing
+# Per-machine settings may live in an untracked .env at the repo root
+# (see .env.example). Only HERDR_WEB_PORT is read, and the file is parsed, not
+# sourced. A value already in the environment wins.
+if [ -z "${HERDR_WEB_PORT:-}" ] && [ -f "$BUNDLE_DIR/.env" ]; then
+  HERDR_WEB_PORT="$(sed -n "s/^[[:space:]]*HERDR_WEB_PORT[[:space:]]*=[[:space:]]*[\"']\{0,1\}\([^\"'[:space:]#]*\).*/\1/p" "$BUNDLE_DIR/.env" | tail -1)"
+fi
+TAILNET_PORT="${HERDR_WEB_PORT:-8444}"  # see the comment in the tailscale serve section — load-bearing
+case "$TAILNET_PORT" in
+  ''|*[!0-9]*) echo "HERDR_WEB_PORT must be a port number, got: '$TAILNET_PORT'" >&2; exit 1 ;;
+esac
 SHARE_DIR="$HOME/.local/share/herdr-web"
 
 # Pinned deliberately. The browser loads nothing from the network at runtime
@@ -28,13 +37,42 @@ XTERM_VER=5.5.0
 FIT_VER=0.10.0
 
 echo "== Prerequisites =="
+# Pick the package manager from os-release (ID, then ID_LIKE) rather than from
+# whichever binary happens to be on PATH. Only ttyd comes from the distro.
+OS_RELEASE="${OS_RELEASE:-/etc/os-release}"
+OS_ID="$( . "$OS_RELEASE" 2>/dev/null && echo "${ID:-} ${ID_LIKE:-}" || true)"
+case " $OS_ID " in
+  *" fedora "*|*" rhel "*|*" centos "*) PKG_INSTALL="sudo dnf install -y" ;;
+  *" debian "*|*" ubuntu "*)           PKG_INSTALL="sudo apt-get install -y" ;;
+  *)                                   PKG_INSTALL="" ;;
+esac
+echo "Detected OS: $( . "$OS_RELEASE" 2>/dev/null && echo "${PRETTY_NAME:-$OS_ID}" || echo unknown) (installer: ${PKG_INSTALL:-none})"
+
 if ! command -v ttyd >/dev/null; then
-  sudo dnf install -y ttyd
+  [ -n "$PKG_INSTALL" ] || { echo "Unsupported distro and ttyd is not installed — install ttyd yourself, then re-run." >&2; exit 1; }
+  $PKG_INSTALL ttyd
 else
   echo "ttyd already installed ($(ttyd --version 2>&1 | head -1)) — leaving as-is."
 fi
-command -v npm >/dev/null || { echo "npm is required to vendor xterm.js" >&2; exit 1; }
+# Debian/Ubuntu's ttyd package ships and auto-starts a system ttyd.service
+# (`login` on 127.0.0.1:7681), which takes our port and is a root-owned shell
+# endpoint we don't want anyway. Fedora's package doesn't start one, so this is
+# a no-op there.
+if systemctl is-enabled --quiet ttyd.service 2>/dev/null || systemctl is-active --quiet ttyd.service 2>/dev/null; then
+  echo "Disabling the distro's system ttyd.service (it holds :$PORT)."
+  sudo systemctl disable --now ttyd.service
+fi
 [ -x "$HOME/.local/bin/herdr" ] || { echo "~/.local/bin/herdr not found — install herdr first: curl -fsSL https://herdr.dev/install.sh | sh" >&2; exit 1; }
+
+# Fail before changing anything if the tailnet port is taken by something other
+# than our own earlier `tailscale serve` registration (a re-run is fine).
+if command -v tailscale >/dev/null && tailscale status >/dev/null 2>&1; then
+  if ! tailscale serve status --json 2>/dev/null | python3 -c 'import json,sys; sys.exit(0 if sys.argv[1] in (json.load(sys.stdin) or {}).get("TCP", {}) else 1)' "$TAILNET_PORT" \
+     && [ -n "$(ss -tlnH "sport = :$TAILNET_PORT")" ]; then
+    echo "Port $TAILNET_PORT is already in use on this machine — re-run with HERDR_WEB_PORT=<free port> (not 443, 8443 or 10000)." >&2
+    exit 1
+  fi
+fi
 
 echo "== Vendor xterm.js (${XTERM_VER}) + addon-fit (${FIT_VER}) =="
 TMP="$(mktemp -d)"
@@ -42,7 +80,15 @@ trap 'rm -rf "$TMP"' EXIT
 
 fetch_pkg() {  # $1 = npm spec, $2 = destination dir
   local tgz
-  tgz="$(cd "$TMP" && npm pack --silent "$1")"
+  if command -v npm >/dev/null; then
+    tgz="$(cd "$TMP" && npm pack --silent "$1")"
+  else
+    # No npm: fetch the same registry tarball `npm pack` would. "@scope/name@ver"
+    # lives at https://registry.npmjs.org/@scope/name/-/name-ver.tgz
+    local name="${1%@*}" ver="${1##*@}"
+    tgz="${name##*/}-${ver}.tgz"
+    curl -fsSL -o "$TMP/$tgz" "https://registry.npmjs.org/${name}/-/${tgz}"
+  fi
   mkdir -p "$2"
   tar -xzf "$TMP/$tgz" -C "$2" --strip-components=1
 }
@@ -124,7 +170,8 @@ echo "== Tailscale serve (tailnet-only HTTPS) =="
 # is STRUCTURALLY ineligible for Funnel — no later `tailscale funnel` mistake
 # can publish an unauthenticated root-capable shell to the internet. 8443 looks
 # like the more natural number and would quietly give up that guarantee.
-# Do not "tidy" this to 8443.
+# Do not "tidy" this to 8443. If 8444 is taken on your machine, override it with
+# HERDR_WEB_PORT — any free port except 443, 8443 and 10000 keeps the guarantee.
 if ! command -v tailscale >/dev/null || ! tailscale status >/dev/null 2>&1; then
   echo "Tailscale not running — skipping tailnet exposure. Service is live on 127.0.0.1:$PORT only." >&2
 else
@@ -133,7 +180,12 @@ else
   # Register the herdr-web endpoint. If you have other serve entries from
   # a prior install, re-register them manually (the stale-entry cleanup
   # block was removed — it was machine-specific).
-  tailscale serve --bg --https="$TAILNET_PORT" "http://127.0.0.1:$PORT"
+  tailscale serve --bg --https="$TAILNET_PORT" "http://127.0.0.1:$PORT" || {
+    echo "tailscale serve failed. Check that your user is a Tailscale operator" >&2
+    echo "(sudo tailscale set --operator=\$USER) and that Serve/HTTPS certificates are" >&2
+    echo "enabled for your tailnet (tailscale prints an enable link on first use)." >&2
+    exit 1
+  }
   echo
   echo "herdr in the browser: https://${DNSNAME}:${TAILNET_PORT}"
 fi

@@ -39,12 +39,19 @@ server and every running agent keep running. This is like SSH + detach.
 Prerequisites
 -------------
 
-  1. A Linux box running Fedora (or compatible). The script uses `dnf` to
-     install ttyd and expects systemd --user services.
+  1. A Linux box running Fedora/RHEL or Debian/Ubuntu. The script reads
+     /etc/os-release and installs ttyd with `dnf` or `apt-get` accordingly,
+     and expects systemd --user services.
   2. The `herdr` binary installed at `~/.local/bin/herdr`.
      Install from: curl -fsSL https://herdr.dev/install.sh | sh
-  3. `npm` installed (used once to vendor xterm.js).
-  4. Tailscale installed and running (provides the HTTPS endpoint).
+  3. `npm` (optional — used once to vendor xterm.js; without it the
+     installer downloads the same tarballs from the npm registry with curl).
+  4. Tailscale installed, logged in, and running (provides the HTTPS
+     endpoint). Your user must be a Tailscale operator so the installer can
+     run `tailscale serve` without sudo:
+       sudo tailscale set --operator=$USER
+     Serve (HTTPS certificates) must be enabled for the tailnet; the first
+     `tailscale serve` prints a link to enable it if it isn't.
   5. `python3` available (stdlib, for the template splicing step).
   6. `loginctl` available (for enabling linger so services survive logout).
 
@@ -59,7 +66,9 @@ Installation
        bash ~/.local/share/herdr-web-installer/scripts/install.sh
 
      The script does all of the following automatically:
-       * Installs ttyd via dnf (if not already present)
+       * Installs ttyd via dnf or apt-get (if not already present)
+       * Disables the distro's own system ttyd.service if one is running
+         (Debian/Ubuntu's package starts one on port 7681)
        * Vendors xterm.js 5.5.0 and addon-fit 0.10.0
        * Generates a self-contained index.html at
          ~/.local/share/herdr-web/index.html
@@ -71,10 +80,41 @@ Installation
      or run:
        tailscale serve status
 
+Choosing a different port
+-------------------------
+
+  The tailnet endpoint defaults to :8444. If something else on the machine
+  already listens there, the installer stops before changing anything. Pick
+  another port with HERDR_WEB_PORT:
+
+    HERDR_WEB_PORT=8445 bash scripts/install.sh
+
+  or, to make it stick for this machine, put it in an untracked .env at the
+  repo root (see .env.example):
+
+    echo 'HERDR_WEB_PORT=8445' > .env
+
+  Avoid 443, 8443 and 10000 — those are the ports Funnel can publish to the
+  internet, and staying off them is what keeps this shell tailnet-only.
+  If you use the environment variable instead of .env, pass the same value
+  every time you re-run the installer.
+
+Debian / Ubuntu notes
+---------------------
+
+  * The ttyd package enables a system ttyd.service (a `login` prompt on
+    127.0.0.1:7681). The installer disables it — it collides with herdr-web
+    and is a root-owned shell endpoint you don't need.
+  * On a server, consider `sudo tailscale up --operator=$USER
+    --accept-dns=false` so Tailscale doesn't take over the host's DNS. If the
+    machine sits on a subnet that another node advertises, leave
+    --accept-routes off (the default on Linux).
+
 Usage
 -----
 
-  1. Open https://<your-tailscale-hostname>:8444 in Safari on your iPad.
+  1. Open https://<your-tailscale-hostname>:8444 (or your HERDR_WEB_PORT)
+     in Safari on your iPad.
      The tailnet's device identity is the authentication — no password.
 
   2. If you lost the device, revoke its node key in the Tailscale admin
